@@ -75,8 +75,8 @@ download_iso() {
   # Python fallback (works if python3 available and network allowed)
   if cmd_exists python3; then
     echo "[*] Trying Python fallback downloader..."
-    python3 - <<PYCODE
-import sys,urllib.request
+    if python3 - "${ISO_URL}" <<'PY'
+import sys, urllib.request
 url = sys.argv[1]
 out = "win.iso"
 try:
@@ -87,30 +87,13 @@ try:
             if not chunk:
                 break
             f.write(chunk)
-    print("OK")
+    # success
+    sys.exit(0)
 except Exception as e:
-    print("ERR", e)
+    print("PY_DOWNLOAD_ERROR:", e, file=sys.stderr)
     sys.exit(2)
-PYCODE
-    # run python with URL
-    # note: above heredoc doesn't receive arg; call different way
-    if python3 - <<'PY' "${ISO_URL}"
-import sys,urllib.request
-url = sys.argv[1]
-out = "win.iso"
-try:
-    with urllib.request.urlopen(url) as r, open(out, "wb") as f:
-        block = 1024*1024
-        while True:
-            chunk = r.read(block)
-            if not chunk:
-                break
-            f.write(chunk)
-    print("DL_OK")
-except Exception as e:
-    print("DL_ERR", e)
-    sys.exit(2)
-PY" "${ISO_URL}"; then
+PY
+    then
       echo "[*] ISO downloaded with Python fallback (size: $(du -h win.iso | cut -f1))."
       return 0
     else
