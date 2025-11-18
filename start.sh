@@ -2,104 +2,157 @@
 set -euo pipefail
 
 # ---------------- Configurable via env ----------------
-PORT="${PORT:-8080}"            # Railway will set PORT automatically
+PORT="${PORT:-8080}"            # Railway sets this
 ISO_URL="${ISO_URL:-}"          # direct ISO link (optional)
 VM_IMG="${VM_IMG:-win.qcow2}"
-VM_RAM="${VM_RAM:-512}"         # in MB (set to 1024 or more if available)
+VM_RAM="${VM_RAM:-512}"         # in MB (increase if available)
 VM_SMP="${VM_SMP:-1}"
-VNC_PORT="${VNC_PORT:-5901}"    # qemu VNC listening port (local)
+VNC_PORT="${VNC_PORT:-5901}"
 VNC_DISPLAY="${VNC_DISPLAY:-:1}"
-DISK_SIZES=("10G" "6G" "3G")    # fallback sizes if create fails
+DISK_SIZES=("10G" "6G" "3G")
 QEMU_LOG="/tmp/qemu.log"
 # -----------------------------------------------------
 
 echo "Starting Container"
 echo "[*] PORT=${PORT} VM_RAM=${VM_RAM}MB ISO_URL=${ISO_URL:+(provided)}"
 
-# Ensure qemu-img available (try to install at runtime if missing)
+QEMU_PID=""
+WEBSOCKIFY_PID=""
+
+# Helper: attempt to run command, return 0 if OK
+cmd_exists() { command -v "$1" >/dev/null 2>&1; }
+
+# Try to ensure qemu-img (attempt runtime install only if apt exists and we are root)
 ensure_qemu() {
-  if ! command -v qemu-img >/dev/null 2>&1; then
-    echo "[*] qemu-img not found. Attempting runtime install of qemu-utils..."
-    if command -v apt-get >/dev/null 2>&1 && [ "$(id -u)" = "0" ]; then
+  if ! cmd_exists qemu-img; then
+    echo "[*] qemu-img not found. Attempting runtime install..."
+    if cmd_exists apt-get && [ "$(id -u)" = "0" ]; then
       apt-get update -y || true
       DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qemu-utils qemu-system-x86 || {
-        echo "ERROR: failed to install qemu-utils at runtime. You should rebuild the image with qemu packages in Dockerfile."
+        echo "ERROR: runtime apt install failed. Please rebuild image with qemu packages in Dockerfile."
         return 1
       }
       echo "[*] qemu-utils installed."
     else
-      echo "ERROR: cannot install packages at runtime (no apt or not root). Please rebuild the image with qemu packages."
+      echo "WARN: qemu-img missing and cannot install at runtime."
       return 1
     fi
   fi
   return 0
 }
 
-# Try ensure qemu-img; if fails, continue but qemu-img will be missing
-if ! ensure_qemu; then
-  echo "Continuing but qemu-img may be missing. qemu-img required to create disk images."
-fi
-
-# Function: attempt to create qcow2 disk with fallback sizes
-create_disk_with_fallbacks() {
-  if [ -f "${VM_IMG}" ]; then
-    echo "[*] Disk ${VM_IMG} already exists."
+# Download using curl/wget or Python fallback
+download_iso() {
+  if [ -f win.iso ]; then
+    echo "[*] win.iso already present."
     return 0
   fi
+  if [ -z "${ISO_URL}" ]; then
+    echo "[*] No ISO_URL provided and win.iso not found."
+    return 2
+  fi
 
+  echo "[*] Attempting ISO download from ISO_URL..."
+
+  if cmd_exists curl; then
+    if curl -L --fail --retry 5 --retry-delay 5 "${ISO_URL}" -o win.iso; then
+      echo "[*] ISO downloaded with curl (size: $(du -h win.iso | cut -f1))."
+      return 0
+    else
+      echo "WARN: curl download failed."
+    fi
+  fi
+
+  if cmd_exists wget; then
+    if wget --tries=5 -O win.iso "${ISO_URL}"; then
+      echo "[*] ISO downloaded with wget (size: $(du -h win.iso | cut -f1))."
+      return 0
+    else
+      echo "WARN: wget download failed."
+    fi
+  fi
+
+  # Python fallback (works if python3 available and network allowed)
+  if cmd_exists python3; then
+    echo "[*] Trying Python fallback downloader..."
+    python3 - <<PYCODE
+import sys,urllib.request
+url = sys.argv[1]
+out = "win.iso"
+try:
+    with urllib.request.urlopen(url) as r, open(out, "wb") as f:
+        block = 1024*1024
+        while True:
+            chunk = r.read(block)
+            if not chunk:
+                break
+            f.write(chunk)
+    print("OK")
+except Exception as e:
+    print("ERR", e)
+    sys.exit(2)
+PYCODE
+    # run python with URL
+    # note: above heredoc doesn't receive arg; call different way
+    if python3 - <<'PY' "${ISO_URL}"
+import sys,urllib.request
+url = sys.argv[1]
+out = "win.iso"
+try:
+    with urllib.request.urlopen(url) as r, open(out, "wb") as f:
+        block = 1024*1024
+        while True:
+            chunk = r.read(block)
+            if not chunk:
+                break
+            f.write(chunk)
+    print("DL_OK")
+except Exception as e:
+    print("DL_ERR", e)
+    sys.exit(2)
+PY" "${ISO_URL}"; then
+      echo "[*] ISO downloaded with Python fallback (size: $(du -h win.iso | cut -f1))."
+      return 0
+    else
+      echo "WARN: Python fallback failed (maybe network blocked)."
+    fi
+  fi
+
+  echo "ERROR: ISO download failed. Neither curl/wget nor Python succeeded."
+  return 1
+}
+
+# Create qcow2 disk with fallback sizes
+create_disk_with_fallbacks() {
+  if [ -f "${VM_IMG}" ]; then
+    echo "[*] Disk ${VM_IMG} exists."
+    return 0
+  fi
+  if ! cmd_exists qemu-img; then
+    echo "ERROR: qemu-img not available; cannot create disk."
+    return 1
+  fi
   for size in "${DISK_SIZES[@]}"; do
     echo "[*] Creating disk ${VM_IMG} size=${size} ..."
     if qemu-img create -f qcow2 "${VM_IMG}" "${size}"; then
       echo "[*] Created disk ${VM_IMG} (${size})"
       return 0
     else
-      echo "[!] Failed to create ${size}. Trying smaller size..."
+      echo "WARN: creating ${size} failed; trying smaller."
     fi
   done
-
-  echo "ERROR: Failed to create any disk size. Check host storage/quota."
+  echo "ERROR: failed to create any disk size; check host quota."
   return 1
 }
 
-# Download ISO if ISO_URL provided and win.iso not present
-download_iso_if_needed() {
-  if [ -f win.iso ]; then
-    echo "[*] win.iso already present locally."
-    return 0
-  fi
-  if [ -n "${ISO_URL}" ]; then
-    echo "[*] Downloading ISO from ISO_URL..."
-    # prefer curl then wget
-    if command -v curl >/dev/null 2>&1; then
-      curl -L --fail --retry 5 --retry-delay 5 "${ISO_URL}" -o win.iso || {
-        echo "ERROR: ISO download failed (curl)."
-        return 1
-      }
-    elif command -v wget >/dev/null 2>&1; then
-      wget --tries=5 -O win.iso "${ISO_URL}" || {
-        echo "ERROR: ISO download failed (wget)."
-        return 1
-      }
-    else
-      echo "ERROR: neither curl nor wget available to download ISO."
-      return 1
-    fi
-    echo "[*] ISO downloaded to win.iso (size: $(du -h win.iso | cut -f1))."
-    return 0
-  fi
+KVM_AVAILABLE() { [ -c /dev/kvm ] 2>/dev/null && return 0 || return 1; }
 
-  echo "No ISO present and no ISO_URL provided. Place win.iso in project root or set ISO_URL env var."
-  return 2
-}
-
-# Check for /dev/kvm (KVM availability). If missing, remove -enable-kvm later.
-KVM_AVAILABLE() {
-  [ -c /dev/kvm ] 2>/dev/null && return 0 || return 1
-}
-
-# Start QEMU with dynamic options (no -enable-kvm if unavailable)
 start_qemu() {
-  # Build qemu command in variable
+  if ! cmd_exists qemu-system-x86_64; then
+    echo "ERROR: qemu-system-x86_64 missing; cannot start qemu."
+    return 1
+  fi
+
   QEMU_CMD=(qemu-system-x86_64
     -m "${VM_RAM}"
     -smp "${VM_SMP}"
@@ -110,72 +163,75 @@ start_qemu() {
     -vnc 127.0.0.1:1
     -device virtio-net-pci,netdev=net0
     -netdev user,id=net0,hostfwd=tcp::3389-:3389
-    -nographic
-    -monitor none
+    -nographic -monitor none
   )
 
   if KVM_AVAILABLE; then
     QEMU_CMD+=(-enable-kvm)
-    echo "[*] KVM available; starting qemu with -enable-kvm"
+    echo "[*] KVM available; using -enable-kvm"
   else
-    echo "[*] KVM not available on this host; starting qemu in software emulation (slower)."
+    echo "[*] KVM not available; running in software emulation (slow)."
   fi
 
   echo "[*] Launching QEMU..."
-  # Start qemu in background, redirect stdout/stderr to log
   nohup "${QEMU_CMD[@]}" >"${QEMU_LOG}" 2>&1 &
   QEMU_PID=$!
   echo "[*] qemu pid=${QEMU_PID}"
   sleep 3
-}
-
-# Start websockify to expose noVNC
-start_websockify() {
-  # Ensure websockify is available (installed in Dockerfile via pip)
-  if ! command -v websockify >/dev/null 2>&1; then
-    # try python -m websockify fallback
-    if python3 -m websockify --help >/dev/null 2>&1; then
-      WEBSOCKIFY_CMD=(python3 -m websockify)
-    elif [ -x /usr/local/bin/websockify ]; then
-      WEBSOCKIFY_CMD=("/usr/local/bin/websockify")
-    else
-      echo "ERROR: websockify not found. noVNC won't work."
-      return 1
-    fi
-  else
-    WEBSOCKIFY_CMD=(websockify)
+  # quick check if it's still alive
+  if ! kill -0 "${QEMU_PID}" >/dev/null 2>&1; then
+    echo "ERROR: qemu process died shortly after start. Check ${QEMU_LOG}."
+    return 2
   fi
-
-  echo "[*] Starting websockify to bridge websocket -> 127.0.0.1:${VNC_PORT}"
-  # serve noVNC static files and bridge to VNC
-  nohup "${WEBSOCKIFY_CMD[@]}" --web /opt/noVNC "${PORT}" 127.0.0.1:${VNC_PORT} > /tmp/websockify.log 2>&1 &
-  WEBSOCKIFY_PID=$!
-  echo "[*] websockify pid=${WEBSOCKIFY_PID}"
   return 0
 }
 
-# Trap to stop processes gracefully
+start_websockify() {
+  # prefer installed websockify, else python -m websockify
+  if cmd_exists websockify; then
+    WS_CMD=(websockify)
+  elif python3 -m websockify --help >/dev/null 2>&1; then
+    WS_CMD=(python3 -m websockify)
+  elif [ -x /opt/noVNC/utils/websockify/run ]; then
+    WS_CMD=(/opt/noVNC/utils/websockify/run)
+  else
+    echo "ERROR: websockify not available; cannot serve noVNC."
+    return 1
+  fi
+
+  echo "[*] Starting websockify -> 127.0.0.1:${VNC_PORT} via port ${PORT}"
+  nohup "${WS_CMD[@]}" --web /opt/noVNC "${PORT}" 127.0.0.1:${VNC_PORT} > /tmp/websockify.log 2>&1 &
+  WEBSOCKIFY_PID=$!
+  echo "[*] websockify pid=${WEBSOCKIFY_PID}"
+  sleep 1
+  if ! kill -0 "${WEBSOCKIFY_PID}" >/dev/null 2>&1; then
+    echo "ERROR: websockify died shortly after start. See /tmp/websockify.log"
+    return 2
+  fi
+  return 0
+}
+
+# Cleanup: kill known procs only (avoid pkill)
 cleanup() {
   echo "[*] Cleaning up..."
-  pkill -P $$ || true
-  if [ -n "${QEMU_PID:-}" ]; then
-    kill "${QEMU_PID}" >/dev/null 2>&1 || true
-  fi
-  if [ -n "${WEBSOCKIFY_PID:-}" ]; then
+  if [ -n "${WEBSOCKIFY_PID}" ]; then
+    echo "[*] Killing websockify pid ${WEBSOCKIFY_PID}..."
     kill "${WEBSOCKIFY_PID}" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${QEMU_PID}" ]; then
+    echo "[*] Killing qemu pid ${QEMU_PID}..."
+    kill "${QEMU_PID}" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
 # MAIN
-# 1) ensure qemu-img present (attempt if not)
 ensure_qemu || true
 
-# 2) download ISO or wait for local win.iso
-download_iso_if_needed || {
-  code=$?
-  if [ "$code" -eq 2 ]; then
-    echo "[*] Waiting for win.iso to appear in project root. Container will stay alive."
+download_iso || {
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    echo "[*] No ISO available. Place win.iso in project root or set ISO_URL. Container will wait."
     tail -f /dev/null
     exit 0
   else
@@ -184,19 +240,22 @@ download_iso_if_needed || {
   fi
 }
 
-# 3) create qcow2 disk with fallbacks
 create_disk_with_fallbacks || exit 1
 
-# 4) start QEMU
-start_qemu
+start_qemu || exit 1
 
-# 5) start websockify / noVNC
 start_websockify || {
-  echo "ERROR: failed to start websockify/noVNC. Check logs."
+  echo "ERROR: failed to start websockify/noVNC. Exiting."
   exit 1
 }
 
-# 6) print helpful hints and tail logs
 echo "===================================================================="
 echo "noVNC should be available at: http://<deployment-host>:${PORT}/vnc.html"
-echo "If needed: http://<deployment-host>:${PORT}/v
+echo "If needed: http://<deployment-host>:${PORT}/vnc.html?host=<deployment-host>&port=${PORT}"
+echo "During install: use the attached CD (win.iso) to install Windows 8.1 onto ${VM_IMG}."
+echo "After install: shut down VM from within Windows and restart without -cdrom to boot from disk."
+echo "To enable RDP inside Windows: enable Remote Desktop inside Windows and set a user password."
+echo "===================================================================="
+echo ""
+
+tail -f "${QEMU_LOG}"
