@@ -1,4 +1,4 @@
-# Dockerfile - includes qemu, websockify, noVNC, curl/wget
+# Dockerfile for Northflank - QEMU + noVNC image
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -6,6 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LC_ALL=C.UTF-8 \
     TZ=UTC
 
+# Install required packages
 RUN apt-get update && apt-get install -y --no-install-recommends \
     qemu-utils \
     qemu-system-x86 \
@@ -33,9 +34,11 @@ RUN pip3 install --no-cache-dir websockify==0.10.0 \
 
 WORKDIR /root
 
+# Copy start script
 COPY start.sh /usr/local/bin/start.sh
 RUN chmod +x /usr/local/bin/start.sh
 
+# Northflank sets PORT env automatically; default 8080
 ENV PORT 8080
 
 CMD ["/usr/local/bin/start.sh"]
