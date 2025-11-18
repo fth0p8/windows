@@ -1,10 +1,16 @@
+# Dockerfile - build image with qemu, noVNC, websockify, and helpers
 FROM ubuntu:22.04
 
-ENV DEBIAN_FRONTEND=noninteractive
-# install required packages
-RUN apt-get update && apt-get install -y \
-    qemu-system-x86 \
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    TZ=UTC
+
+# Install required packages (qemu, python, websockify deps, git, curl, wget)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     qemu-utils \
+    qemu-system-x86 \
+    qemu-kvm \
     python3 \
     python3-pip \
     wget \
@@ -16,12 +22,13 @@ RUN apt-get update && apt-get install -y \
     net-tools \
     unzip \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    bash-completion \
+ && rm -rf /var/lib/apt/lists/*
 
-# Install websockify and noVNC
-RUN pip3 install websockify==0.10.0
-RUN git clone https://github.com/novnc/noVNC.git /opt/noVNC \
-    && git clone https://github.com/novnc/websockify /opt/noVNC/utils/websockify
+# Install websockify via pip and clone noVNC
+RUN pip3 install --no-cache-dir websockify==0.10.0 \
+ && git clone https://github.com/novnc/noVNC.git /opt/noVNC \
+ && git clone https://github.com/novnc/websockify /opt/noVNC/utils/websockify
 
 WORKDIR /root
 
@@ -29,8 +36,7 @@ WORKDIR /root
 COPY start.sh /usr/local/bin/start.sh
 RUN chmod +x /usr/local/bin/start.sh
 
-# Expose port used by web UI (Railway expects HTTP port)
-# We'll use $PORT (Railway sets the env var), default 8080 if missing
+# Expose the HTTP port (Railway will map $PORT). We use runtime PORT env to start websockify.
 ENV PORT 8080
 
 CMD ["/usr/local/bin/start.sh"]
