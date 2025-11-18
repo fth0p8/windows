@@ -1,4 +1,4 @@
-# Dockerfile for Northflank - QEMU + noVNC image
+# Dockerfile for Northflank - QEMU + noVNC image (with line-ending normalization)
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -25,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     iproute2 \
     bash-completion \
+    sed \
  && rm -rf /var/lib/apt/lists/*
 
 # Install websockify and clone noVNC
@@ -34,11 +35,13 @@ RUN pip3 install --no-cache-dir websockify==0.10.0 \
 
 WORKDIR /root
 
-# Copy start script
+# Copy start script and normalize line endings + make it executable
 COPY start.sh /usr/local/bin/start.sh
-RUN chmod +x /usr/local/bin/start.sh
+RUN sed -i 's/\r$//' /usr/local/bin/start.sh \
+ && chmod +x /usr/local/bin/start.sh
 
 # Northflank sets PORT env automatically; default 8080
 ENV PORT 8080
 
-CMD ["/usr/local/bin/start.sh"]
+# Use bash to run the script (safer wrt shebang/line endings)
+CMD ["bash", "/usr/local/bin/start.sh"]
